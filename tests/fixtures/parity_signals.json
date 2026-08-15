@@ -1,0 +1,25 @@
+{
+  "fixture": "parity_bars.csv",
+  "schema": "shotgun-parity-signals-v2-5m",
+  "signals": [
+    {
+      "side": "short",
+      "timestamp": 1783920000000
+    },
+    {
+      "side": "short",
+      "timestamp": 1783923000000
+    },
+    {
+      "side": "short",
+      "timestamp": 1784193600000
+    },
+    {
+      "side": "long",
+      "timestamp": 1784505900000
+    }
+  ],
+  "slice_first_open_time": 1783437000000,
+  "slice_last_close_time": 1784636999999,
+  "source_csv_sha256": "8d2f214b457a67c91c0a29026e113fbd38d7e5109eae19eabad36bf3028dffb4"
+}

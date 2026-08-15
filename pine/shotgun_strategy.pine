@@ -1,0 +1,328 @@
+//@version=6
+strategy(
+     "Shotgun v2 — 5m Cost-Aware Trend-Pullback",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.12,
+     slippage = 0,
+     margin_long = 100,
+     margin_short = 100,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     use_bar_magnifier = true)
+
+// Shotgun v2 is deliberately frozen as a REJECTED research candidate. The Python reference engine is the
+// authoritative conservative execution model; this strategy shares its signal
+// formulas and percentage cost model. See docs/pine.md for emulator limits.
+
+const int FAST_LEN = 21
+const int SLOW_LEN = 55
+const int REGIME_LEN = 200
+const int ATR_LEN = 14
+const int RSI_LEN = 14
+const int DI_LEN = 14
+const int ADX_SMOOTHING = 14
+const int VOLUME_LEN = 20
+const int SLOPE_LOOKBACK = 5
+const int PULLBACK_LEN = 8
+const int TRIGGER_LEN = 3
+const int STRUCTURE_LEN = 8
+const int WARMUP_BARS = 250
+const int MIN_TREND_EXIT_BARS = 3
+const int MAX_HOLD_BARS = 36
+const int COOLDOWN_BARS = 12
+
+const float ADX_FLOOR = 22.0
+const float PULLBACK_ATR_TOLERANCE = 0.20
+const float SLOW_BOUND_ATR_TOLERANCE = 0.50
+const float MIN_BODY_ATR = 0.30
+const float LONG_MIN_CLV = 0.65
+const float SHORT_MAX_CLV = 0.35
+const float LONG_RSI_MIN = 52.0
+const float LONG_RSI_MAX = 70.0
+const float SHORT_RSI_MIN = 30.0
+const float SHORT_RSI_MAX = 48.0
+const float MIN_VOLUME_RATIO = 1.00
+const float MAX_STRETCH_ATR = 1.50
+const float MIN_ATR_FRACTION = 0.0006
+const float MAX_ATR_FRACTION = 0.008
+const float STRUCTURE_BUFFER_ATR = 0.10
+const float MIN_RISK_ATR = 1.50
+const float MAX_RISK_ATR = 3.00
+const float MIN_PRICE_RISK_FRACTION = 0.0040
+const float MAX_PRICE_RISK_FRACTION = 0.0100
+const float MIN_NET_TARGET_PLANNED_R = 0.75
+const float TARGET_R = 1.80
+const float PROFIT_LOCK_TRIGGER_R = 0.80
+const float LOCKED_PROFIT_R = 0.10
+const float RISK_FRACTION = 0.0025
+const float COST_RATE = 0.0012
+const float MAX_ENTRY_GAP_RISK = 0.35
+
+float emaFast = ta.ema(close, FAST_LEN)
+float emaSlow = ta.ema(close, SLOW_LEN)
+float emaRegime = ta.ema(close, REGIME_LEN)
+float atr = ta.atr(ATR_LEN)
+float volumeSma = ta.sma(volume, VOLUME_LEN)
+
+// DMI is expanded instead of delegated to ta.dmi so bar zero has explicit
+// zero directional movement, exactly as in the Python numerical contract.
+float trueRange = bar_index == 0 ? high - low : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float upMove = bar_index == 0 ? 0.0 : high - high[1]
+float downMove = bar_index == 0 ? 0.0 : low[1] - low
+float plusMovement = upMove > downMove and upMove > 0.0 ? upMove : 0.0
+float minusMovement = downMove > upMove and downMove > 0.0 ? downMove : 0.0
+float smoothedTrueRange = ta.rma(trueRange, DI_LEN)
+float smoothedPlusMovement = ta.rma(plusMovement, DI_LEN)
+float smoothedMinusMovement = ta.rma(minusMovement, DI_LEN)
+float plusDi = not na(smoothedTrueRange) and smoothedTrueRange != 0.0 ? 100.0 * smoothedPlusMovement / smoothedTrueRange : not na(smoothedTrueRange) ? 0.0 : na
+float minusDi = not na(smoothedTrueRange) and smoothedTrueRange != 0.0 ? 100.0 * smoothedMinusMovement / smoothedTrueRange : not na(smoothedTrueRange) ? 0.0 : na
+float diDenominator = plusDi + minusDi
+float dx = na(diDenominator) ? na : diDenominator == 0.0 ? 0.0 : 100.0 * math.abs(plusDi - minusDi) / diDenominator
+float adx = ta.rma(dx, ADX_SMOOTHING)
+
+// The explicit flat-series cases are part of the cross-runtime RSI contract.
+float closeChange = ta.change(close)
+float averageGain = ta.rma(math.max(closeChange, 0.0), RSI_LEN)
+float averageLoss = ta.rma(math.max(-closeChange, 0.0), RSI_LEN)
+float rsi = na(averageGain) or na(averageLoss) ? na : averageGain == 0.0 and averageLoss == 0.0 ? 50.0 : averageLoss == 0.0 ? 100.0 : averageGain == 0.0 ? 0.0 : 100.0 - 100.0 / (1.0 + averageGain / averageLoss)
+
+float candleRange = high - low
+float closeLocation = candleRange == 0.0 ? 0.5 : (close - low) / candleRange
+float candleBody = math.abs(close - open)
+float atrFraction = close > 0.0 ? atr / close : na
+float priorTriggerHigh = ta.highest(high[1], TRIGGER_LEN)
+float priorTriggerLow = ta.lowest(low[1], TRIGGER_LEN)
+float supportLevel = ta.lowest(low, STRUCTURE_LEN)
+float resistanceLevel = ta.highest(high, STRUCTURE_LEN)
+float longStructureStop = supportLevel - STRUCTURE_BUFFER_ATR * atr
+float shortStructureStop = resistanceLevel + STRUCTURE_BUFFER_ATR * atr
+float longRiskDistance = math.max(math.max(MIN_RISK_ATR * atr, MIN_PRICE_RISK_FRACTION * close), close - longStructureStop)
+float shortRiskDistance = math.max(math.max(MIN_RISK_ATR * atr, MIN_PRICE_RISK_FRACTION * close), shortStructureStop - close)
+float longTargetPriceAtSignal = close + TARGET_R * longRiskDistance
+float shortTargetPriceAtSignal = close - TARGET_R * shortRiskDistance
+float longNetTargetR = (TARGET_R * longRiskDistance - COST_RATE * (close + longTargetPriceAtSignal)) / (longRiskDistance + 2.0 * close * COST_RATE)
+float shortNetTargetR = (TARGET_R * shortRiskDistance - COST_RATE * (close + shortTargetPriceAtSignal)) / (shortRiskDistance + 2.0 * close * COST_RATE)
+
+bool longPullbackTouch = false
+bool shortPullbackTouch = false
+bool longPullbackBound = true
+bool shortPullbackBound = true
+for offset = 1 to PULLBACK_LEN
+    bool valuesReady = not na(emaFast[offset]) and not na(emaSlow[offset]) and not na(atr[offset])
+    longPullbackTouch := longPullbackTouch or (valuesReady and low[offset] <= emaFast[offset] + PULLBACK_ATR_TOLERANCE * atr[offset])
+    shortPullbackTouch := shortPullbackTouch or (valuesReady and high[offset] >= emaFast[offset] - PULLBACK_ATR_TOLERANCE * atr[offset])
+    longPullbackBound := longPullbackBound and valuesReady and close[offset] >= emaSlow[offset] - SLOW_BOUND_ATR_TOLERANCE * atr[offset]
+    shortPullbackBound := shortPullbackBound and valuesReady and close[offset] <= emaSlow[offset] + SLOW_BOUND_ATR_TOLERANCE * atr[offset]
+
+bool indicatorsReady = not na(emaFast) and not na(emaSlow) and not na(emaRegime) and not na(emaSlow[SLOPE_LOOKBACK]) and not na(atr) and not na(rsi) and not na(plusDi) and not na(minusDi) and not na(adx) and not na(volumeSma) and not na(priorTriggerHigh) and not na(priorTriggerLow)
+bool volatilityReady = indicatorsReady and atr > 0.0 and atrFraction >= MIN_ATR_FRACTION and atrFraction <= MAX_ATR_FRACTION
+bool participationReady = indicatorsReady and volume >= MIN_VOLUME_RATIO * volumeSma
+bool bodyReady = indicatorsReady and candleBody >= MIN_BODY_ATR * atr
+
+bool longRegime = indicatorsReady and close > emaRegime and emaFast > emaSlow and emaSlow > emaRegime and emaSlow > emaSlow[SLOPE_LOOKBACK]
+bool shortRegime = indicatorsReady and close < emaRegime and emaFast < emaSlow and emaSlow < emaRegime and emaSlow < emaSlow[SLOPE_LOOKBACK]
+bool longStrength = indicatorsReady and adx >= ADX_FLOOR and plusDi > minusDi
+bool shortStrength = indicatorsReady and adx >= ADX_FLOOR and minusDi > plusDi
+bool longResumption = indicatorsReady and close > priorTriggerHigh and close > open and bodyReady and closeLocation >= LONG_MIN_CLV
+bool shortResumption = indicatorsReady and close < priorTriggerLow and close < open and bodyReady and closeLocation <= SHORT_MAX_CLV
+bool longMomentum = indicatorsReady and rsi >= LONG_RSI_MIN and rsi <= LONG_RSI_MAX
+bool shortMomentum = indicatorsReady and rsi >= SHORT_RSI_MIN and rsi <= SHORT_RSI_MAX
+float longStretch = close - emaFast
+float shortStretch = emaFast - close
+bool longQuality = volatilityReady and longStretch >= 0.0 and longStretch <= MAX_STRETCH_ATR * atr
+bool shortQuality = volatilityReady and shortStretch >= 0.0 and shortStretch <= MAX_STRETCH_ATR * atr
+bool longRiskReady = indicatorsReady and longRiskDistance > 0.0 and longRiskDistance <= MAX_RISK_ATR * atr and longRiskDistance <= MAX_PRICE_RISK_FRACTION * close and longNetTargetR >= MIN_NET_TARGET_PLANNED_R
+bool shortRiskReady = indicatorsReady and shortRiskDistance > 0.0 and shortRiskDistance <= MAX_RISK_ATR * atr and shortRiskDistance <= MAX_PRICE_RISK_FRACTION * close and shortNetTargetR >= MIN_NET_TARGET_PLANNED_R
+
+bool rawLongSetup = longRegime and longStrength and longPullbackTouch and longPullbackBound and longResumption and longMomentum and participationReady and longQuality and longRiskReady
+bool rawShortSetup = shortRegime and shortStrength and shortPullbackTouch and shortPullbackBound and shortResumption and shortMomentum and participationReady and shortQuality and shortRiskReady
+
+var int lastExitBar = na
+var int entryBar = na
+var bool closeExitQueued = false
+var bool entryPending = false
+var float lockedRiskDistance = na
+var float lockedTargetDistance = na
+var float activeStopPrice = na
+var float activeTargetPrice = na
+var bool profitLocked = false
+var float pendingSignalClose = na
+var float pendingRiskDistance = na
+var float lastSignalPrice = na
+var float lastSignalRisk = na
+var int lastSignalTime = na
+var string lastSignalSide = "None"
+var bool lastEntryExceededGap = false
+
+// This audit happens on the bar after a signal even when Pine's bracket closes
+// the new position before the script observes an open position at bar close.
+bool auditedPendingEntryThisBar = entryPending and not na(pendingSignalClose) and not na(pendingRiskDistance)
+if auditedPendingEntryThisBar
+    lastEntryExceededGap := math.abs(open - pendingSignalClose) > MAX_ENTRY_GAP_RISK * pendingRiskDistance
+
+bool closedThisBar = ta.change(strategy.closedtrades) > 0
+if closedThisBar
+    lastExitBar := bar_index
+    entryBar := na
+    closeExitQueued := false
+    entryPending := false
+    lockedRiskDistance := na
+    lockedTargetDistance := na
+    activeStopPrice := na
+    activeTargetPrice := na
+    profitLocked := false
+
+bool openedThisBar = strategy.position_size != 0.0 and nz(strategy.position_size[1]) == 0.0
+if openedThisBar
+    entryBar := bar_index
+    closeExitQueued := false
+    entryPending := false
+    profitLocked := false
+    activeStopPrice := strategy.position_size > 0.0 ? strategy.position_avg_price - lockedRiskDistance : strategy.position_avg_price + lockedRiskDistance
+    activeTargetPrice := strategy.position_size > 0.0 ? strategy.position_avg_price + lockedTargetDistance : strategy.position_avg_price - lockedTargetDistance
+    lastEntryExceededGap := not na(pendingSignalClose) and not na(pendingRiskDistance) and math.abs(open - pendingSignalClose) > MAX_ENTRY_GAP_RISK * pendingRiskDistance
+
+int barsHeld = strategy.position_size != 0.0 and not na(entryBar) ? bar_index - entryBar + 1 : 0
+
+// Protection advances only from a completed close. If filled exactly, the
+// replacement stop offsets modeled charges and locks 0.10R net. Gaps can still
+// produce a loss. The profit target is never moved.
+float direction = strategy.position_size > 0.0 ? 1.0 : strategy.position_size < 0.0 ? -1.0 : 0.0
+float closeProgressR = strategy.position_size != 0.0 and not na(pendingRiskDistance) and pendingRiskDistance > 0.0 ? direction * (close - strategy.position_avg_price) / pendingRiskDistance : na
+bool activateProfitLock = barstate.isconfirmed and strategy.position_size != 0.0 and not profitLocked and not na(closeProgressR) and closeProgressR >= PROFIT_LOCK_TRIGGER_R
+if activateProfitLock
+    float plannedRiskPerUnit = pendingRiskDistance + 2.0 * pendingSignalClose * COST_RATE
+    float exactProfitLockedStop = strategy.position_size > 0.0 ? (strategy.position_avg_price * (1.0 + COST_RATE) + LOCKED_PROFIT_R * plannedRiskPerUnit) / (1.0 - COST_RATE) : (strategy.position_avg_price * (1.0 - COST_RATE) - LOCKED_PROFIT_R * plannedRiskPerUnit) / (1.0 + COST_RATE)
+    activeStopPrice := strategy.position_size > 0.0 ? math.max(activeStopPrice, exactProfitLockedStop) : math.min(activeStopPrice, exactProfitLockedStop)
+    profitLocked := true
+    if strategy.position_size > 0.0
+        strategy.exit("Long Bracket", from_entry = "Long", stop = activeStopPrice, limit = activeTargetPrice, comment_loss = "profit-locked stop", comment_profit = "target", alert_loss = "SHOTGUN_LONG_PROFIT_LOCKED_STOP", alert_profit = "SHOTGUN_LONG_TARGET")
+        alert("{\"event\":\"risk_state\",\"side\":\"long\",\"state\":\"profit_locked_gap_risk\",\"time\":\"" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\",\"stop\":" + str.tostring(activeStopPrice, format.mintick) + ",\"locked_net_r\":" + str.tostring(LOCKED_PROFIT_R) + "}", alert.freq_once_per_bar_close)
+    else
+        strategy.exit("Short Bracket", from_entry = "Short", stop = activeStopPrice, limit = activeTargetPrice, comment_loss = "profit-locked stop", comment_profit = "target", alert_loss = "SHOTGUN_SHORT_PROFIT_LOCKED_STOP", alert_profit = "SHOTGUN_SHORT_TARGET")
+        alert("{\"event\":\"risk_state\",\"side\":\"short\",\"state\":\"profit_locked_gap_risk\",\"time\":\"" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\",\"stop\":" + str.tostring(activeStopPrice, format.mintick) + ",\"locked_net_r\":" + str.tostring(LOCKED_PROFIT_R) + "}", alert.freq_once_per_bar_close)
+
+bool longTrendInvalid = strategy.position_size > 0.0 and barsHeld >= MIN_TREND_EXIT_BARS and close < emaSlow
+bool shortTrendInvalid = strategy.position_size < 0.0 and barsHeld >= MIN_TREND_EXIT_BARS and close > emaSlow
+bool timedOut = strategy.position_size != 0.0 and barsHeld >= MAX_HOLD_BARS
+
+if barstate.isconfirmed and strategy.position_size != 0.0 and not closeExitQueued and (longTrendInvalid or shortTrendInvalid or timedOut)
+    string closeReason = timedOut ? "time" : "trend"
+    if strategy.position_size > 0.0
+        strategy.close("Long", comment = closeReason, alert_message = "SHOTGUN_LONG_" + str.upper(closeReason) + "_EXIT")
+    else
+        strategy.close("Short", comment = closeReason, alert_message = "SHOTGUN_SHORT_" + str.upper(closeReason) + "_EXIT")
+    closeExitQueued := true
+
+bool cooldownReady = na(lastExitBar) or bar_index > lastExitBar + COOLDOWN_BARS
+bool timeframeReady = timeframe.isminutes and timeframe.multiplier == 5
+bool canSignal = timeframeReady and barstate.isconfirmed and bar_index >= WARMUP_BARS and strategy.position_size == 0.0 and not entryPending and cooldownReady
+bool longSignal = canSignal and rawLongSetup and not rawShortSetup
+bool shortSignal = canSignal and rawShortSetup and not rawLongSetup
+
+if longSignal
+    float equityAtSignal = math.max(strategy.equity, 0.0)
+    float riskQuantity = equityAtSignal * RISK_FRACTION / (longRiskDistance + 2.0 * close * COST_RATE)
+    float exposureQuantity = close > 0.0 ? equityAtSignal / close : 0.0
+    float quantity = math.min(riskQuantity, exposureQuantity)
+    int riskTicks = int(math.max(1.0, math.round(longRiskDistance / syminfo.mintick)))
+    int targetTicks = int(math.max(1.0, math.round(riskTicks * TARGET_R)))
+    lockedRiskDistance := riskTicks * syminfo.mintick
+    lockedTargetDistance := targetTicks * syminfo.mintick
+    pendingRiskDistance := longRiskDistance
+    pendingSignalClose := close
+    lastSignalPrice := close
+    lastSignalRisk := longRiskDistance
+    lastSignalTime := time
+    lastSignalSide := "Long"
+    profitLocked := false
+    entryPending := true
+    if quantity > 0.0
+        strategy.entry("Long", strategy.long, qty = quantity, comment = "long signal", alert_message = "SHOTGUN_LONG_ENTRY")
+        strategy.exit("Long Bracket", from_entry = "Long", loss = riskTicks, profit = targetTicks, comment_loss = "stop", comment_profit = "target", alert_message = "SHOTGUN_LONG_BRACKET_EXIT")
+        alert("{\"event\":\"signal\",\"side\":\"long\",\"time\":\"" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\",\"close\":" + str.tostring(close, format.mintick) + ",\"support\":" + str.tostring(supportLevel, format.mintick) + ",\"resistance\":" + str.tostring(resistanceLevel, format.mintick) + ",\"risk_distance\":" + str.tostring(longRiskDistance, format.mintick) + "}", alert.freq_once_per_bar_close)
+    else
+        entryPending := false
+
+if shortSignal
+    float equityAtSignal = math.max(strategy.equity, 0.0)
+    float riskQuantity = equityAtSignal * RISK_FRACTION / (shortRiskDistance + 2.0 * close * COST_RATE)
+    float exposureQuantity = close > 0.0 ? equityAtSignal / close : 0.0
+    float quantity = math.min(riskQuantity, exposureQuantity)
+    int riskTicks = int(math.max(1.0, math.round(shortRiskDistance / syminfo.mintick)))
+    int targetTicks = int(math.max(1.0, math.round(riskTicks * TARGET_R)))
+    lockedRiskDistance := riskTicks * syminfo.mintick
+    lockedTargetDistance := targetTicks * syminfo.mintick
+    pendingRiskDistance := shortRiskDistance
+    pendingSignalClose := close
+    lastSignalPrice := close
+    lastSignalRisk := shortRiskDistance
+    lastSignalTime := time
+    lastSignalSide := "Short"
+    profitLocked := false
+    entryPending := true
+    if quantity > 0.0
+        strategy.entry("Short", strategy.short, qty = quantity, comment = "short signal", alert_message = "SHOTGUN_SHORT_ENTRY")
+        strategy.exit("Short Bracket", from_entry = "Short", loss = riskTicks, profit = targetTicks, comment_loss = "stop", comment_profit = "target", alert_message = "SHOTGUN_SHORT_BRACKET_EXIT")
+        alert("{\"event\":\"signal\",\"side\":\"short\",\"time\":\"" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\",\"close\":" + str.tostring(close, format.mintick) + ",\"support\":" + str.tostring(supportLevel, format.mintick) + ",\"resistance\":" + str.tostring(resistanceLevel, format.mintick) + ",\"risk_distance\":" + str.tostring(shortRiskDistance, format.mintick) + "}", alert.freq_once_per_bar_close)
+    else
+        entryPending := false
+
+float activeEntry = strategy.position_size != 0.0 ? strategy.position_avg_price : na
+float activeStop = strategy.position_size != 0.0 ? activeStopPrice : na
+float activeTarget = strategy.position_size != 0.0 ? activeTargetPrice : na
+bool rawParityLong = timeframeReady and barstate.isconfirmed and bar_index >= WARMUP_BARS and rawLongSetup and not rawShortSetup
+bool rawParityShort = timeframeReady and barstate.isconfirmed and bar_index >= WARMUP_BARS and rawShortSetup and not rawLongSetup
+float paritySignal = rawParityLong ? 1.0 : rawParityShort ? -1.0 : na
+
+plot(emaFast, "EMA 55", color = color.new(color.teal, 0), linewidth = 1)
+plot(emaSlow, "EMA 144", color = color.new(color.orange, 0), linewidth = 1)
+plot(emaRegime, "EMA 500", color = color.new(color.gray, 20), linewidth = 2)
+plot(supportLevel, "8-bar Support", color = color.new(color.lime, 55), style = plot.style_linebr)
+plot(resistanceLevel, "8-bar Resistance", color = color.new(color.red, 55), style = plot.style_linebr)
+plot(activeEntry, "Active Entry", color = color.new(color.blue, 0), style = plot.style_linebr, linewidth = 2)
+plot(activeStop, "Active Stop", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(activeTarget, "Active Target", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(paritySignal, "Shotgun Parity Signal", display = display.data_window)
+plotshape(longSignal, title = "Confirmed Long Setup", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "L")
+plotshape(shortSignal, title = "Confirmed Short Setup", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small, text = "S")
+bgcolor(lastEntryExceededGap and (openedThisBar or auditedPendingEntryThisBar) ? color.new(color.orange, 82) : na, title = "Python gap-skip divergence warning")
+
+var table status = table.new(position.top_right, 2, 12, border_width = 1)
+if barstate.islast
+    string regimeText = longRegime ? "Long" : shortRegime ? "Short" : "Neutral"
+    string positionText = strategy.position_size > 0.0 ? "Long" : strategy.position_size < 0.0 ? "Short" : entryPending ? "Pending" : "Flat"
+    string signalTimeText = na(lastSignalTime) ? "—" : str.format_time(lastSignalTime, "yyyy-MM-dd HH:mm 'UTC'", "UTC")
+    string signalPriceText = na(lastSignalPrice) ? "—" : str.tostring(lastSignalPrice, format.mintick)
+    string signalRiskText = na(lastSignalRisk) ? "—" : str.tostring(lastSignalRisk, format.mintick)
+    string gapText = lastEntryExceededGap ? "BREACH: see docs" : "Within model band"
+    string riskStateText = strategy.position_size != 0.0 ? profitLocked ? "PROFIT-LOCKED / GAP RISK" : "AT RISK" : entryPending ? "PENDING / GAP RISK" : "FLAT"
+    table.cell(status, 0, 0, "SHOTGUN v2 · 5m", bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(status, 1, 0, "REJECTED / PAPER ONLY", bgcolor = color.new(color.red, 65), text_color = color.white)
+    table.cell(status, 0, 1, "Regime")
+    table.cell(status, 1, 1, regimeText)
+    table.cell(status, 0, 2, "Position")
+    table.cell(status, 1, 2, positionText)
+    table.cell(status, 0, 3, "Last signal")
+    table.cell(status, 1, 3, lastSignalSide + " · " + signalTimeText)
+    table.cell(status, 0, 4, "Signal close")
+    table.cell(status, 1, 4, signalPriceText)
+    table.cell(status, 0, 5, "Risk distance")
+    table.cell(status, 1, 5, signalRiskText)
+    table.cell(status, 0, 6, "Held bars")
+    table.cell(status, 1, 6, str.tostring(barsHeld))
+    table.cell(status, 0, 7, "Entry gap audit")
+    table.cell(status, 1, 7, gapText, text_color = lastEntryExceededGap ? color.orange : color.silver)
+    table.cell(status, 0, 8, "Risk state")
+    table.cell(status, 1, 8, riskStateText, text_color = profitLocked ? color.lime : strategy.position_size != 0.0 ? color.red : color.silver)
+    table.cell(status, 0, 9, "Support")
+    table.cell(status, 1, 9, str.tostring(supportLevel, format.mintick))
+    table.cell(status, 0, 10, "Resistance")
+    table.cell(status, 1, 10, str.tostring(resistanceLevel, format.mintick))
+    table.cell(status, 0, 11, "Timeframe")
+    table.cell(status, 1, 11, timeframeReady ? "5m · ready" : "WRONG · USE 5m", text_color = timeframeReady ? color.silver : color.red)

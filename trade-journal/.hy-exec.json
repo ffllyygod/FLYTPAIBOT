@@ -1,0 +1,13 @@
+{
+  "last_cycle_at": "2026-07-13 13:49:26",
+  "last_cycle": [
+    "BTCUSD     NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "ETHUSD     NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "XRPUSD     NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "SOLUSD     NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "DOGEUSD    NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "ADAUSD     NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "AVAXUSD    NEUTRAL conf=0.00 -> REJECTED [no setup]",
+    "LINKUSD    NEUTRAL conf=0.00 -> REJECTED [no setup]"
+  ]
+}
